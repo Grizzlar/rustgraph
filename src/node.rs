@@ -4,7 +4,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 use std::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
-use std::cell::RefCell;
 use crate::NodePool;
 use crate::event::Event;
 
@@ -18,7 +17,9 @@ pub struct Node<'a> {
 pub struct NodeData {
     id: u8,
     rounds: u8,
-    peers: HashMap<u8, String>
+    peers: HashMap<u8, String>,
+    graphs: HashMap<u8, Mutex<Vec<Arc<Mutex<Event>>>>>,
+    events: Mutex<Vec<Arc<Mutex<Event>>>>
 }
 
 impl <'a> Node<'a> {
@@ -30,15 +31,16 @@ impl <'a> Node<'a> {
         let node_count = self.pool.nodes.borrow().len() as u8;
 
         let mut map = HashMap::new();
-        let mut graphs: HashMap<u8, RefCell<Vec<Event>>> = HashMap::new();
+        let mut graphs: HashMap<u8, Mutex<Vec<Arc<Mutex<Event>>>>> = HashMap::new();
+        let events: Vec<Arc<Mutex<Event>>> = Vec::new();
         for i in 0..node_count {
             if i != self.id {
                 map.insert(i, format!("127.0.0.1:212{}", i));
             }
-            graphs.insert(i, RefCell::new(Vec::new()));
+            graphs.insert(i, Mutex::new(Vec::new()));
         }
 
-        let thread = spawn_tread(self.id, self.rounds, map, graphs);
+        let thread = spawn_tread(self.id, self.rounds, map, graphs, events);
         self.thread = Some(thread);
     }
 }
@@ -48,23 +50,25 @@ fn now() -> u32 {
     SystemTime::now().elapsed().unwrap().as_secs() as u32
 }
 
-fn spawn_tread(id: u8, rounds: u8, peers: HashMap<u8, String>, graphs: HashMap<u8, RefCell<Vec<Event>>>) -> JoinHandle<()> {    
+fn spawn_tread(id: u8, rounds: u8, peers: HashMap<u8, String>, graphs: HashMap<u8, Mutex<Vec<Arc<Mutex<Event>>>>>, events: Vec<Arc<Mutex<Event>>>) -> JoinHandle<()> {    
     thread::spawn(move || {
-        let graphs = Arc::new(Mutex::new(graphs));
+        let events = Mutex::new(events);
         let data = Arc::new(NodeData {
             id,
             rounds,
-            peers
+            peers,
+            graphs,
+            events
         });
 
-        let mut guard = graphs.lock().unwrap();
-        guard.get(&data.id).unwrap().borrow_mut().push(
-            Event::new(data.id, 0, 0, 0, now())
-        );
-        drop(guard);
+        let event = Event::new(data.id, 0, 0, 0, now());
+        let mut eguard = data.events.lock().unwrap();
+        eguard.push(Arc::new(Mutex::new(event)));
+        data.graphs.get(&data.id).unwrap().lock().unwrap().push(Arc::clone(eguard.last().unwrap()));
+        drop(eguard);
 
-        let recv = (Arc::clone(&graphs), Arc::clone(&data));
-        let send = (Arc::clone(&graphs), Arc::clone(&data));
+        let recv = Arc::clone(&data);
+        let send = Arc::clone(&data);
         let receiver = thread::spawn(move || send_sync(recv));
         let sender = thread::spawn(move || recv_sync(send));
         receiver.join();
@@ -72,10 +76,7 @@ fn spawn_tread(id: u8, rounds: u8, peers: HashMap<u8, String>, graphs: HashMap<u
     })
 }
 
-fn recv_sync(params: (Arc<Mutex<HashMap<u8, RefCell<Vec<Event>>>>>, Arc<NodeData>)) {
-    let graph = params.0;
-    let data = params.1;
-
+fn recv_sync(data: Arc<NodeData>) {
     let listener = TcpListener::bind(format!("127.0.0.1:212{}", data.id)).unwrap();
     for stream in listener.incoming() {
         let mut stream = stream.unwrap();
@@ -87,24 +88,25 @@ fn recv_sync(params: (Arc<Mutex<HashMap<u8, RefCell<Vec<Event>>>>>, Arc<NodeData
             event.visualize();
             
             // TODO: HASH
-            let guard = graph.lock().unwrap();
-            let mut self_events = guard.get(&data.id).unwrap().borrow_mut();
-            if let Some(gossip_events) = guard.get(&event.sender()) {
-                let mut gossip_events = gossip_events.borrow_mut();
-                gossip_events.push(event);
-                let self_parent_hash = self_events.last().unwrap().hash();
-                self_events.push(
-                    Event::new(data.id, 0, self_parent_hash, gossip_events.last().unwrap().hash(), now())
-                );
+            let mut eguard = data.events.lock().unwrap();
+            let mut self_events = data.graphs.get(&data.id).unwrap().lock().unwrap();
+            if let Some(gossip_events) = data.graphs.get(&event.sender()) {
+                let mut gossip_events = gossip_events.lock().unwrap();
+                let gossip_parent_hash = event.hash();
+                let event = Mutex::new(event);
+                eguard.push(Arc::new(event));
+                gossip_events.push(Arc::clone(eguard.last().unwrap()));
+
+                let self_parent_hash = self_events.last().unwrap().lock().unwrap().hash();
+                let event = Mutex::new(Event::new(data.id, 0, self_parent_hash, gossip_parent_hash, now()));
+                eguard.push(Arc::new(event));
+                self_events.push(Arc::clone(eguard.last().unwrap()));
             }
         }
     }
 }
 
-fn send_sync(params: (Arc<Mutex<HashMap<u8, RefCell<Vec<Event>>>>>, Arc<NodeData>)) {
-    let graph = params.0;
-    let data = params.1;
-    
+fn send_sync(data: Arc<NodeData>) {
     let mut keys = data.peers.keys().cycle();
     while let Some(key) = keys.next() {
         let peer = data.peers.get(&key).unwrap();
