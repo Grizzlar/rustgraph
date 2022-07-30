@@ -102,7 +102,17 @@ fn recv_sync(params: (Arc<Mutex<HashMap<u8, RefCell<Vec<Event>>>>>, Arc<NodeData
 }
 
 fn send_sync(params: (Arc<Mutex<HashMap<u8, RefCell<Vec<Event>>>>>, Arc<NodeData>)) {
-    loop {
-
+    let graph = params.0;
+    let data = params.1;
+    
+    let mut keys = data.peers.keys().cycle();
+    while let Some(key) = keys.next() {
+        let peer = data.peers.get(&key).unwrap();
+        match TcpStream::connect(&peer) {
+            Ok(mut stream) => {
+                stream.write(&[64 + data.id, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]);
+            }
+            _ => { println!("Connection Error: {}", peer) }
+        }
     }
 }
